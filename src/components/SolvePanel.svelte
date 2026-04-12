@@ -255,17 +255,17 @@
     solveProgress = { stage: 'preparing', totalPercent: 0, stagePercent: 0 };
 
     try {
-      const previousSnapshot =
-        attr === '질서'
-          ? profile.solveInfo.orderAfter?.gemSnapshot
-          : profile.solveInfo.chaosAfter?.gemSnapshot;
+      // For isNew detection: compare against previously *assigned* gems, not the full pool.
+      // A gem is new if it wasn't assigned to any core in the previous result.
+      const previousAttrAfter = attr === '질서' ? profile.solveInfo.orderAfter : profile.solveInfo.chaosAfter;
+      const previousAssigned = previousAttrAfter?.solveAnswer?.assignedGems.flat();
       const currentGems = attr === '질서' ? profile.gems.orderGems : profile.gems.chaosGems;
 
       const result = await solverController.runSolve(profile, attr);
 
       const solveAfter: SolveAfter = {
         solveAnswer: {
-          assignedGems: buildAssignedGems(result.assignedGemIndexes, previousSnapshot),
+          assignedGems: buildAssignedGems(result.assignedGemIndexes, previousAssigned),
           gemSetPackTuple: result.gemSetPackTuple,
         },
         scoreSet: result.scoreSet,

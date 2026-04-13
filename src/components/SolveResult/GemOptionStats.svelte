@@ -1,6 +1,4 @@
 <script lang="ts">
-  import type { ArkGridAttr } from '../../lib/constants/enums';
-  import { LChaos, LOrder } from '../../lib/constants/localization';
   import { type ArkGridGem, type ArkGridGemOptionName, ArkGridGemOptionTypes } from '../../lib/models/arkGridGems';
   import { appLocale } from '../../lib/state/locale.state.svelte';
   import type { SolveAnswer } from '../../lib/state/profile.state.svelte';
@@ -8,9 +6,8 @@
   type Props = {
     solveAnswer?: SolveAnswer;
     assignedGems?: ArkGridGem[][];
-    attr?: ArkGridAttr;
   };
-  let { solveAnswer, assignedGems, attr }: Props = $props();
+  let { solveAnswer, assignedGems }: Props = $props();
   let answerStatistics: Record<ArkGridGemOptionName, number> = $derived.by(() => {
     let statistics = {
       공격력: 0,
@@ -31,11 +28,8 @@
     return statistics;
   });
   let locale = $derived(appLocale.current);
-  const LAttrPrefix = $derived(
-    attr ? (attr === '질서' ? LOrder[locale] : LChaos[locale]) + ' ' : ''
-  );
   const LTitle = $derived(
-    LAttrPrefix + { ko_kr: '젬 옵션', en_us: 'Astrogem Options' }[locale]
+    { ko_kr: '젬 옵션', en_us: 'Astrogem Options' }[locale]
   );
 </script>
 

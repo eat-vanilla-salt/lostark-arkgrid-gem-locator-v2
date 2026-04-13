@@ -1,4 +1,4 @@
-import { type ArkGridAttr, ArkGridAttrs } from '../constants/enums';
+import { ArkGridAttrs } from '../constants/enums';
 import {
   type ArkGridCoreCoeffs,
   ArkGridCoreTypes,
@@ -7,6 +7,7 @@ import {
 import { type ArkGridGem, gemFingerprint } from '../models/arkGridGems';
 import type { CharacterProfile } from '../state/profile.state.svelte';
 import type {
+  PlainGemSetPack,
   SolverProgress,
   SolverRunPayload,
   SolverRunResult,
@@ -90,114 +91,248 @@ function buildCurrentBitmasks(
   });
 }
 
-type Deferred = {
-  resolve: (result: SolverRunResult) => void;
+// DP knapsack: compute the maximum achievable att/skill/boss for a single core
+// without enumerating all C(n,4) GemSet objects.
+//
+// Constraints (matching getPossibleGemSets):
+//   • up to 4 gems per set
+//   • sum(req) ≤ core.energy
+//   • sum(point) ≥ core.point
+//
+// dp[k][e][p] = max stat value using exactly k gems with total req=e and total point=p.
+// O(n × 4 × E × maxP) per core per stat — microseconds for n≤100.
+function computeCoreMaxStat(
+  energy: number,
+  point: number,
+  gems: Array<{ req: number; point: number; value: number }>
+): number {
+  const maxK = 4;
+  const maxP = 25; // 4 gems × max 5 points each = 20; 25 gives a safe margin
+
+  // Use a flat Float64Array for speed.  -1 = unreachable.
+  const stride2 = maxP + 1;
+  const stride1 = (energy + 1) * stride2;
+  const stride0 = (maxK + 1) * stride1;
+  const dp = new Float64Array(stride0).fill(-1);
+  dp[0] = 0; // dp[k=0][e=0][p=0] = 0
+
+  for (const gem of gems) {
+    if (gem.req > energy) continue;
+    // Process in reverse k to avoid reusing the same gem (0/1 knapsack).
+    for (let k = maxK - 1; k >= 0; k--) {
+      for (let e = energy - gem.req; e >= 0; e--) {
+        for (let p = 0; p <= maxP; p++) {
+          const cur = dp[k * stride1 + e * stride2 + p];
+          if (cur < 0) continue;
+          const newK = k + 1;
+          const newE = e + gem.req;
+          const newP = Math.min(p + gem.point, maxP);
+          const newVal = cur + gem.value;
+          const idx = newK * stride1 + newE * stride2 + newP;
+          if (newVal > dp[idx]) dp[idx] = newVal;
+        }
+      }
+    }
+  }
+
+  // Valid states: k ≥ (point>0 ? 1 : 0), e ≤ energy, p ≥ point
+  let result = 0;
+  const startK = point > 0 ? 1 : 0;
+  for (let k = startK; k <= maxK; k++) {
+    for (let e = 0; e <= energy; e++) {
+      for (let p = point; p <= maxP; p++) {
+        const v = dp[k * stride1 + e * stride2 + p];
+        if (v > result) result = v;
+      }
+    }
+  }
+  return result;
+}
+
+// Convert ArkGridGem option stats to [att, skill, boss] for a given isSupporter setting.
+function gemToStats(
+  gem: ArkGridGem,
+  isSupporter: boolean
+): { att: number; skill: number; boss: number } {
+  const optionNames = isSupporter
+    ? ['아군 피해 강화', '낙인력', '아군 공격 강화']
+    : ['공격력', '추가 피해', '보스 피해'];
+  let att = 0, skill = 0, boss = 0;
+  for (const opt of [gem.option1, gem.option2]) {
+    const idx = optionNames.indexOf(opt.optionType);
+    if (idx === 0) att += opt.value;
+    else if (idx === 1) skill += opt.value;
+    else if (idx === 2) boss += opt.value;
+  }
+  return { att, skill, boss };
+}
+
+// Compute combined attMax/skillMax/bossMax across all 6 cores using DP knapsack.
+// Runs in the main thread — no GemSet objects are created.
+function computeMaxStats(
+  orderCores: WorkerCore[],
+  chaosCores: WorkerCore[],
+  orderGems: ArkGridGem[],
+  chaosGems: ArkGridGem[],
+  isSupporter: boolean
+): { attMax: number; skillMax: number; bossMax: number } {
+  const coreGemPairs: Array<{ core: WorkerCore; gems: ArkGridGem[] }> = [
+    ...orderCores.map((c) => ({ core: c, gems: orderGems })),
+    ...chaosCores.map((c) => ({ core: c, gems: chaosGems })),
+  ];
+
+  let attMax = 0;
+  let skillMax = 0;
+  let bossMax = 0;
+
+  for (const { core, gems } of coreGemPairs) {
+    const attGems = gems.map((g) => ({ req: g.req, point: g.point, value: gemToStats(g, isSupporter).att }));
+    const skillGems = gems.map((g) => ({ req: g.req, point: g.point, value: gemToStats(g, isSupporter).skill }));
+    const bossGems = gems.map((g) => ({ req: g.req, point: g.point, value: gemToStats(g, isSupporter).boss }));
+
+    attMax += computeCoreMaxStat(core.energy, core.point, attGems);
+    skillMax += computeCoreMaxStat(core.energy, core.point, skillGems);
+    bossMax += computeCoreMaxStat(core.energy, core.point, bossGems);
+  }
+
+  return { attMax, skillMax, bossMax };
+}
+
+type Deferred<T> = {
+  resolve: (result: T) => void;
   reject: (reason?: unknown) => void;
 };
 
 export class SolverController {
   private state: 'idle' | 'running' = 'idle';
-  private worker: Worker;
-  private pending: Deferred | null = null;
+  // No persistent worker — we spawn fresh workers per phase and terminate them
+  // so the OS reclaims their memory before the next phase starts.
   onProgress: ((progress: SolverProgress) => void) | null = null;
 
-  constructor() {
-    this.worker = new Worker(new URL('./solverWorker.ts', import.meta.url), {
-      type: 'module',
-    });
-    this.worker.onmessage = (e: MessageEvent<SolverWorkerResponse>) => {
-      this.handleWorkerMessage(e);
-    };
-    this.worker.onerror = (e) => {
-      this.handleWorkerError(e);
-    };
-  }
+  // Spawn a fresh worker, send one message, resolve with the payload field of the done
+  // message or reject on error.  The worker is always terminated before settling.
+  private runWorkerForResult(payload: SolverRunPayload): Promise<SolverRunResult> {
+    return new Promise<SolverRunResult>((resolve, reject) => {
+      const worker = new Worker(new URL('./solverWorker.ts', import.meta.url), { type: 'module' });
 
-  private postMessage(msg: SolverWorkerRequest) {
-    this.worker.postMessage(msg);
-  }
+      worker.onmessage = (e: MessageEvent<SolverWorkerResponse>) => {
+        const data = e.data;
+        if (data.type === 'runSolve:progress' || data.type === 'runSolvePhase2Order:progress') {
+          this.onProgress?.(data.progress);
+          return;
+        }
+        if (data.type === 'runSolve:done') {
+          worker.terminate();
+          resolve(data.result);
+          return;
+        }
+        if (data.type === 'runSolve:error') {
+          worker.terminate();
+          reject(new Error(data.message));
+        }
+      };
 
-  private settlePending(settler: (pending: Deferred) => void) {
-    const pending = this.pending;
-    this.pending = null;
-    this.state = 'idle';
-    if (pending) {
-      settler(pending);
-    }
-  }
+      worker.onerror = (e) => {
+        worker.terminate();
+        reject(e.error ?? new Error(e.message));
+      };
 
-  private handleWorkerMessage(e: MessageEvent<SolverWorkerResponse>) {
-    const data = e.data;
-
-    switch (data.type) {
-      case 'runSolve:progress':
-        this.onProgress?.(data.progress);
-        break;
-      case 'runSolve:done':
-        this.settlePending((pending) => {
-          pending.resolve(data.result);
-        });
-        break;
-      case 'runSolve:error':
-        this.settlePending((pending) => {
-          pending.reject(new Error(data.message));
-        });
-        break;
-    }
-  }
-
-  private handleWorkerError(error: ErrorEvent) {
-    this.settlePending((pending) => {
-      pending.reject(error.error ?? new Error(error.message));
+      worker.postMessage({ type: 'runSolve', payload } satisfies SolverWorkerRequest);
     });
   }
 
-  runSolve(profile: CharacterProfile, attr: ArkGridAttr) {
+  private runWorkerForPhase2Order(payload: SolverRunPayload): Promise<PlainGemSetPack[]> {
+    return new Promise<PlainGemSetPack[]>((resolve, reject) => {
+      const worker = new Worker(new URL('./solverWorker.ts', import.meta.url), { type: 'module' });
+
+      worker.onmessage = (e: MessageEvent<SolverWorkerResponse>) => {
+        const data = e.data;
+        if (data.type === 'runSolvePhase2Order:progress') {
+          this.onProgress?.(data.progress);
+          return;
+        }
+        if (data.type === 'runSolvePhase2Order:done') {
+          worker.terminate();
+          resolve(data.gspList);
+          return;
+        }
+        if (data.type === 'runSolvePhase2Order:error') {
+          worker.terminate();
+          reject(new Error(data.message));
+        }
+      };
+
+      worker.onerror = (e) => {
+        worker.terminate();
+        reject(e.error ?? new Error(e.message));
+      };
+
+      worker.postMessage({ type: 'runSolvePhase2Order', payload } satisfies SolverWorkerRequest);
+    });
+  }
+
+  runSolve(profile: CharacterProfile): Promise<SolverRunResult> {
     if (this.state === 'running') {
       throw new Error('busy');
     }
+    this.state = 'running';
 
+    return this._runSolve(profile).finally(() => {
+      this.state = 'idle';
+    });
+  }
+
+  private async _runSolve(profile: CharacterProfile): Promise<SolverRunResult> {
     const { orderCores, chaosCores } = buildSolverCores(profile);
+    const orderGems = toPlain(profile.gems.orderGems);
+    const chaosGems = toPlain(profile.gems.chaosGems);
 
-    const existingAfter = attr === '질서' ? profile.solveInfo.orderAfter : profile.solveInfo.chaosAfter;
-    const existingAssignedGems = existingAfter?.solveAnswer?.assignedGems;
-    const currentGems = attr === '질서' ? profile.gems.orderGems : profile.gems.chaosGems;
-    const coreOffset = attr === '질서' ? 0 : 3;
-    const currentBitmasks =
-      existingAssignedGems
-        ? buildCurrentBitmasks(existingAssignedGems, currentGems, coreOffset)
-        : undefined;
+    // Derive stability tiebreaker bitmasks from the previous combined result.
+    // Order cores are at offset 0, chaos cores at offset 3 in assignedGems.
+    const prevAssigned = profile.solveInfo.after?.solveAnswer?.assignedGems;
+    const orderCurrentBitmasks = prevAssigned
+      ? buildCurrentBitmasks(prevAssigned, orderGems, 0)
+      : undefined;
+    const chaosCurrentBitmasks = prevAssigned
+      ? buildCurrentBitmasks(prevAssigned, chaosGems, 3)
+      : undefined;
 
-    const payload: SolverRunPayload = {
+    // Step 1 (main thread): compute attMax/skillMax/bossMax via DP — no GemSet objects created.
+    const precomputedStats = computeMaxStats(
       orderCores,
       chaosCores,
-      orderGems: toPlain(profile.gems.orderGems),
-      chaosGems: toPlain(profile.gems.chaosGems),
+      orderGems,
+      chaosGems,
+      profile.isSupporter
+    );
+
+    const basePayload: SolverRunPayload = {
+      orderCores,
+      chaosCores,
+      orderGems,
+      chaosGems,
       isSupporter: profile.isSupporter,
-      attr,
-      currentBitmasks,
+      orderCurrentBitmasks,
+      chaosCurrentBitmasks,
+      precomputedStats,
     };
 
-    this.state = 'running';
-    return new Promise<SolverRunResult>((resolve, reject) => {
-      this.pending = { resolve, reject };
-      try {
-        this.postMessage({
-          type: 'runSolve',
-          payload,
-        });
-      } catch (error) {
-        this.settlePending((pending) => {
-          pending.reject(error);
-        });
-      }
+    // Step 2: Phase-1 worker — builds orderGssList only, runs order Phase 2, terminates.
+    // Peak RAM: ~one attr's GemSet list.  After terminate() the OS reclaims that memory
+    // before the Phase-2+3 worker starts.
+    const orderGspList = await this.runWorkerForPhase2Order(basePayload);
+
+    // Step 3: Phase-2+3 worker — builds chaosGssList only, runs chaos Phase 2,
+    // runs Phase 3 cross-product with the received orderGspList, runs launcher sim.
+    // Peak RAM: ~one attr's GemSet list + tiny serialized orderGspList.
+    return this.runWorkerForResult({
+      ...basePayload,
+      precalculatedOrderGspList: orderGspList,
     });
   }
 
   destroy() {
-    this.settlePending((pending) => {
-      pending.reject(new Error('solver controller disposed'));
-    });
-    this.worker.terminate();
+    // No persistent worker to clean up.
+    this.state = 'idle';
   }
 }

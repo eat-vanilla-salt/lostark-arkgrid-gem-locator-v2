@@ -11,21 +11,18 @@
   type Props = {
     answerCores: Record<ArkGridAttr, Record<ArkGridCoreType, ArkGridCore | null>>;
     solveAnswer: SolveAnswer;
-    attr?: ArkGridAttr;
   };
-  let { answerCores, solveAnswer, attr }: Props = $props();
-  const attrs = $derived(attr ? [attr] : Object.values(ArkGridAttrs));
+  let { answerCores, solveAnswer }: Props = $props();
 </script>
 
 <div class="root">
-  {#each attrs as a}
-    {@const attrIndex = Object.values(ArkGridAttrs).indexOf(a)}
+  {#each Object.values(ArkGridAttrs) as attr, i}
     {#each Object.values(ArkGridCoreTypes) as ctype, j}
       <CoreGemEquipped
-        attr={a}
+        {attr}
         {ctype}
-        core={answerCores[a][ctype]}
-        gems={solveAnswer.assignedGems[attrIndex * 3 + j]}
+        core={answerCores[attr][ctype]}
+        gems={solveAnswer.assignedGems[i * 3 + j]}
       ></CoreGemEquipped>
     {/each}
   {/each}

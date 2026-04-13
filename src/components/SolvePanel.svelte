@@ -1,7 +1,7 @@
 <script lang="ts">
   import { onDestroy } from 'svelte';
 
-  import { type AppLocale, type ArkGridAttr, ArkGridAttrs } from '../lib/constants/enums';
+  import { type AppLocale, ArkGridAttrs } from '../lib/constants/enums';
   import { ArkGridCoreTypes } from '../lib/models/arkGridCores';
   import type { ArkGridGem } from '../lib/models/arkGridGems';
   import { SolverController } from '../lib/solver/solverController';
@@ -10,12 +10,10 @@
   import {
     type CharacterProfile,
     type SolveAfter,
-    updateAttrSolveAfter,
+    updateSolveAfter,
   } from '../lib/state/profile.state.svelte';
   import { gemFingerprint } from '../lib/models/arkGridGems';
   import SolveCoreEdit from './SolveCoreEdit.svelte';
-  import GemOptionStats from './SolveResult/GemOptionStats.svelte';
-  import ScoreIndicator from './SolveResult/ScoreIndicator.svelte';
   import SolveResult from './SolveResult/SolveResult.svelte';
 
   type Props = {
@@ -88,66 +86,24 @@
       en_us: 'Chaos cores optimization failed',
     }[locale]
   );
-  const LCombinedResult = $derived(
-    {
-      ko_kr: '종합 결과 리포트',
-      en_us: 'Combined Result Report',
-    }[locale]
-  );
-  const LOrderResult = $derived(
-    {
-      ko_kr: '질서 결과',
-      en_us: 'Order Result',
-    }[locale]
-  );
-  const LChaosResult = $derived(
-    {
-      ko_kr: '혼돈 결과',
-      en_us: 'Chaos Result',
-    }[locale]
-  );
 
-  // Local $state for results — guaranteed to trigger re-renders.
-  // Initialized from persisted profile so results survive page reload.
-  let orderAfter = $state<SolveAfter | undefined>(profile.solveInfo.orderAfter);
-  let chaosAfter = $state<SolveAfter | undefined>(profile.solveInfo.chaosAfter);
+  // Local $state for result — guaranteed to trigger re-renders.
+  // Initialized from persisted profile so result survives page reload.
+  let solveAfter = $state<SolveAfter | undefined>(profile.solveInfo.after);
 
-  // Combined result derived from both attrs
-  const combinedScoreSet = $derived.by(() => {
-    if (!orderAfter?.scoreSet || !chaosAfter?.scoreSet) return undefined;
-    const o = orderAfter.scoreSet;
-    const c = chaosAfter.scoreSet;
-    const combinedBestScore = o.bestScore + c.bestScore;
+  let failedSign = $derived.by(() => {
+    if (!solveAfter) return { order: false, chaos: false };
+    const answerCores = solveAfter.answerCores;
+    const allOrderCoresNull = !answerCores || Object.values(answerCores['질서']).every((v) => v == null);
+    const allChaosCoresNull = !answerCores || Object.values(answerCores['혼돈']).every((v) => v == null);
     return {
-      score: o.score + c.score,
-      bestScore: combinedBestScore,
-      // Set perfectScore = bestScore so the bar scales to 100% at max potential,
-      // matching the per-attr bar behavior. totalScore = score/bestScore is preserved.
-      perfectScore: combinedBestScore,
+      order: solveAfter.solveAnswer?.gemSetPackTuple.gsp1 === null && !allOrderCoresNull,
+      chaos: solveAfter.solveAnswer?.gemSetPackTuple.gsp2 === null && !allChaosCoresNull,
     };
   });
 
-  const combinedAssignedGems = $derived.by(() => {
-    if (!orderAfter?.solveAnswer || !chaosAfter?.solveAnswer) return undefined;
-    return [...orderAfter.solveAnswer.assignedGems, ...chaosAfter.solveAnswer.assignedGems];
-  });
-
-  let orderFailedSign = $derived.by(() => {
-    if (!orderAfter) return false;
-    const answerCores = orderAfter.answerCores;
-    const allOrderCoresNull = !answerCores || Object.values(answerCores['질서']).every((v) => v == null);
-    return orderAfter.solveAnswer?.gemSetPackTuple.gsp1 === null && !allOrderCoresNull;
-  });
-
-  let chaosFailedSign = $derived.by(() => {
-    if (!chaosAfter) return false;
-    const answerCores = chaosAfter.answerCores;
-    const allChaosCoresNull = !answerCores || Object.values(answerCores['혼돈']).every((v) => v == null);
-    return chaosAfter.solveAnswer?.gemSetPackTuple.gsp2 === null && !allChaosCoresNull;
-  });
-
   const solverController = new SolverController();
-  let activeSolveAttr = $state<ArkGridAttr | null>(null);
+  let isSolving = $state(false);
   let solveProgress = $state<SolverProgress | null>(null);
   let progressLog = $state<ProgressLogEntry[]>([]);
 
@@ -247,23 +203,20 @@
     return `${progress.stage}:${progress.attr ?? ''}`;
   }
 
-  async function runSolve(attr: ArkGridAttr) {
-    if (activeSolveAttr !== null) return;
+  async function runSolve() {
+    if (isSolving) return;
 
-    activeSolveAttr = attr;
+    isSolving = true;
     progressLog = [];
     solveProgress = { stage: 'preparing', totalPercent: 0, stagePercent: 0 };
 
     try {
-      // For isNew detection: compare against previously *assigned* gems, not the full pool.
-      // A gem is new if it wasn't assigned to any core in the previous result.
-      const previousAttrAfter = attr === '질서' ? profile.solveInfo.orderAfter : profile.solveInfo.chaosAfter;
-      const previousAssigned = previousAttrAfter?.solveAnswer?.assignedGems.flat();
-      const currentGems = attr === '질서' ? profile.gems.orderGems : profile.gems.chaosGems;
+      // isNew detection: compare against previously *assigned* gems, not the full pool.
+      const previousAssigned = profile.solveInfo.after?.solveAnswer?.assignedGems.flat();
 
-      const result = await solverController.runSolve(profile, attr);
+      const result = await solverController.runSolve(profile);
 
-      const solveAfter: SolveAfter = {
+      const after: SolveAfter = {
         solveAnswer: {
           assignedGems: buildAssignedGems(result.assignedGemIndexes, previousAssigned),
           gemSetPackTuple: result.gemSetPackTuple,
@@ -272,18 +225,17 @@
         answerCores: JSON.parse(JSON.stringify(profile.cores)),
         additionalGemResult: result.additionalGemResult,
         needLauncherGem: result.needLauncherGem,
-        gemSnapshot: JSON.parse(JSON.stringify(currentGems)),
+        gemSnapshot: JSON.parse(JSON.stringify([
+          ...profile.gems.orderGems,
+          ...profile.gems.chaosGems,
+        ])),
       };
-      updateAttrSolveAfter(attr, solveAfter);
-      if (attr === '질서') {
-        orderAfter = solveAfter;
-      } else {
-        chaosAfter = solveAfter;
-      }
+      updateSolveAfter(after);
+      solveAfter = after;
     } catch (error) {
       console.error(error);
     } finally {
-      activeSolveAttr = null;
+      isSolving = false;
       if (solveProgress) {
         solverController.onProgress?.({
           ...solveProgress,
@@ -293,11 +245,6 @@
         });
       }
     }
-  }
-
-  async function runSolveBoth() {
-    await runSolve('질서');
-    await runSolve('혼돈');
   }
 </script>
 
@@ -315,12 +262,12 @@
       </div>
     </div>
 
-    {#if orderFailedSign || chaosFailedSign}
+    {#if failedSign.order || failedSign.chaos}
       <div class="failed-sign">
-        {#if orderFailedSign}
+        {#if failedSign.order}
           <div class="big">⚠️ {LOrderFailed} ⚠️</div>
         {/if}
-        {#if chaosFailedSign}
+        {#if failedSign.chaos}
           <div class="big">⚠️ {LChaosFailed} ⚠️</div>
         {/if}
         <div class="small">{LFailed}</div>
@@ -328,11 +275,11 @@
     {/if}
     <button
       class="solve-button"
-      onclick={runSolveBoth}
-      disabled={activeSolveAttr !== null}
+      onclick={runSolve}
+      disabled={isSolving}
       data-track="run-solve"
     >
-      {activeSolveAttr !== null ? LRunning : LRunSolve}
+      {isSolving ? LRunning : LRunSolve}
     </button>
     <div class="optimize-hint">
       {LOptimizeHint}
@@ -368,28 +315,8 @@
       </div>
     {/if}
 
-    {#if orderAfter}
-      <div class="attr-result-block">
-        <div class="attr-result-title order-title">{LOrderResult}</div>
-        <SolveResult solveAfter={orderAfter} attr="질서"></SolveResult>
-      </div>
-    {/if}
-
-    {#if chaosAfter}
-      <div class="attr-result-block">
-        <div class="attr-result-title chaos-title">{LChaosResult}</div>
-        <SolveResult solveAfter={chaosAfter} attr="혼돈"></SolveResult>
-      </div>
-    {/if}
-
-    {#if combinedScoreSet && combinedAssignedGems}
-      <div class="attr-result-block">
-        <div class="attr-result-title combined-title">{LCombinedResult}</div>
-        <div class="combined-left">
-          <ScoreIndicator scoreSet={combinedScoreSet} maxDisplayScore={100}></ScoreIndicator>
-          <GemOptionStats assignedGems={combinedAssignedGems}></GemOptionStats>
-        </div>
-      </div>
+    {#if solveAfter}
+      <SolveResult solveAfter={solveAfter}></SolveResult>
     {/if}
   </div>
 </div>
@@ -522,38 +449,5 @@
   }
   .failed-sign > .small {
     font-size: 1rem;
-  }
-  .attr-result-block {
-    width: 100%;
-    display: flex;
-    flex-direction: column;
-    gap: 1rem;
-  }
-  .attr-result-title {
-    font-size: 1.4rem;
-    font-weight: 600;
-    text-align: center;
-    padding: 0.5rem 0;
-    border-bottom: 2px solid var(--border);
-  }
-  .order-title {
-    color: #c94a4a;
-    border-color: #c94a4a;
-  }
-  .chaos-title {
-    color: #4a90d9;
-    border-color: #4a90d9;
-  }
-  .combined-title {
-    color: #7a4acf;
-    border-color: #7a4acf;
-  }
-  .combined-left {
-    display: flex;
-    flex-direction: row;
-    flex-wrap: wrap;
-    gap: 6rem;
-    align-items: flex-start;
-    padding: 1rem 2rem;
   }
 </style>

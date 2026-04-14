@@ -4,6 +4,7 @@ import {
   ArkGridCoreTypes,
   getDefaultCoreEnergy,
 } from '../models/arkGridCores';
+import { type ArkGridGem, gemFingerprint } from '../models/arkGridGems';
 import type { CharacterProfile } from '../state/profile.state.svelte';
 import type {
   SolverProgress,
@@ -58,6 +59,35 @@ function buildSolverCores(
 
 function toPlain<T>(value: T): T {
   return JSON.parse(JSON.stringify(value)) as T;
+}
+
+// Given the previously assigned gem objects (per core) and the current gem list,
+// produce bitmasks (bit i = gem at index i in currentGems is assigned to this core).
+// Matches by fingerprint, consuming one copy per duplicate.
+function buildCurrentBitmasks(
+  assignedGems: ArkGridGem[][],
+  currentGems: ArkGridGem[],
+  coreOffset: number
+): bigint[] {
+  const pool = new Map<string, number[]>();
+  currentGems.forEach((gem, idx) => {
+    const fp = gemFingerprint(gem);
+    if (!pool.has(fp)) pool.set(fp, []);
+    pool.get(fp)!.push(idx);
+  });
+
+  return [0, 1, 2].map((i) => {
+    const gems = assignedGems[coreOffset + i] ?? [];
+    let bitmask = 0n;
+    for (const gem of gems) {
+      const fp = gemFingerprint(gem);
+      const indices = pool.get(fp);
+      if (indices && indices.length > 0) {
+        bitmask |= 1n << BigInt(indices.shift()!);
+      }
+    }
+    return bitmask;
+  });
 }
 
 type Deferred = {
@@ -122,18 +152,33 @@ export class SolverController {
     });
   }
 
-  runSolve(profile: CharacterProfile) {
+  runSolve(profile: CharacterProfile): Promise<SolverRunResult> {
     if (this.state === 'running') {
       throw new Error('busy');
     }
 
     const { orderCores, chaosCores } = buildSolverCores(profile);
+    const orderGems = toPlain(profile.gems.orderGems);
+    const chaosGems = toPlain(profile.gems.chaosGems);
+
+    // Derive stability tiebreaker bitmasks from the previous combined result.
+    // Order cores are at offset 0, chaos cores at offset 3 in assignedGems.
+    const prevAssigned = profile.solveInfo.after?.solveAnswer?.assignedGems;
+    const orderCurrentBitmasks = prevAssigned
+      ? buildCurrentBitmasks(prevAssigned, orderGems, 0)
+      : undefined;
+    const chaosCurrentBitmasks = prevAssigned
+      ? buildCurrentBitmasks(prevAssigned, chaosGems, 3)
+      : undefined;
+
     const payload: SolverRunPayload = {
       orderCores,
       chaosCores,
-      orderGems: toPlain(profile.gems.orderGems),
-      chaosGems: toPlain(profile.gems.chaosGems),
+      orderGems,
+      chaosGems,
       isSupporter: profile.isSupporter,
+      orderCurrentBitmasks,
+      chaosCurrentBitmasks,
     };
 
     this.state = 'running';

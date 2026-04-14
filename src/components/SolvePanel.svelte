@@ -9,12 +9,10 @@
   import { appLocale } from '../lib/state/locale.state.svelte';
   import {
     type CharacterProfile,
-    updateAdditionalGemResult,
-    updateAnswerCores,
-    updateNeedLauncherGem,
-    updateScoreSet,
-    updateSolveAnswer,
+    type SolveAfter,
+    updateSolveAfter,
   } from '../lib/state/profile.state.svelte';
+  import { gemFingerprint } from '../lib/models/arkGridGems';
   import SolveCoreEdit from './SolveCoreEdit.svelte';
   import SolveResult from './SolveResult/SolveResult.svelte';
 
@@ -44,6 +42,18 @@
     {
       ko_kr: '최적화 실행',
       en_us: 'Run Optimization',
+    }[locale]
+  );
+  const LOptimizeHint = $derived(
+    {
+      ko_kr: '이전 결과가 저장됩니다',
+      en_us: 'Previous results are saved',
+    }[locale]
+  );
+  const LOptimizeTooltip = $derived(
+    {
+      ko_kr: '최적화 결과와 젬 목록의 스냅샷이 저장됩니다. 동점일 경우, 이전 배치에서 젬 이동이 가장 적은 배치를 우선합니다. 이전 스냅샷에 없는 새 젬은 결과에서 금색 테두리로 강조 표시됩니다.',
+      en_us: 'Your optimization result and astrogem list are snapshotted. On a tie, the optimizer prefers the assignment that moves the fewest gems from your previous result. Newly added astrogems not present in the previous snapshot are highlighted with a gold border in the results.',
     }[locale]
   );
   const LRunning = $derived(
@@ -77,28 +87,21 @@
     }[locale]
   );
 
+  // Local $state for result — guaranteed to trigger re-renders.
+  // Initialized from persisted profile so result survives page reload.
+  let solveAfter = $state<SolveAfter | undefined>(profile.solveInfo.after);
+
   let failedSign = $derived.by(() => {
-    // 배치 실패 여부 반환
-    if (profile.solveInfo.after) {
-      const answerCores = profile.solveInfo.after.answerCores;
-      const solveAnswer = profile.solveInfo.after.solveAnswer;
-
-      // 코어가 애초에 없으면 실패를 안 함
-      const allOrderCoresNull =
-        !answerCores || Object.values(answerCores['질서']).every((v) => v == null);
-      const allChaosCoresNull =
-        !answerCores || Object.values(answerCores['혼돈']).every((v) => v == null);
-
-      return {
-        order: solveAnswer?.gemSetPackTuple.gsp1 === null && !allOrderCoresNull,
-        chaos: solveAnswer?.gemSetPackTuple.gsp2 === null && !allChaosCoresNull,
-      };
-    }
+    if (!solveAfter) return { order: false, chaos: false };
+    const answerCores = solveAfter.answerCores;
+    const allOrderCoresNull = !answerCores || Object.values(answerCores['질서']).every((v) => v == null);
+    const allChaosCoresNull = !answerCores || Object.values(answerCores['혼돈']).every((v) => v == null);
     return {
-      order: false,
-      chaos: false,
+      order: solveAfter.solveAnswer?.gemSetPackTuple.gsp1 === null && !allOrderCoresNull,
+      chaos: solveAfter.solveAnswer?.gemSetPackTuple.gsp2 === null && !allChaosCoresNull,
     };
   });
+
   const solverController = new SolverController();
   let isSolving = $state(false);
   let solveProgress = $state<SolverProgress | null>(null);
@@ -110,7 +113,6 @@
     const text = `${progress.stagePercent}% ${getProgressLabel(progress)}`;
     const index = progressLog.findIndex((entry) => entry.header === header);
 
-    // progress가 새로 온 거면 하단에 추가, 이미 있는 거면 텍스트만 바꿔치기
     if (index === -1) {
       progressLog = [...progressLog, { header, text }];
       return;
@@ -129,17 +131,32 @@
     solverController.destroy();
   });
 
-  function cloneAssignedGem(gem: ArkGridGem, coreIndex: number): ArkGridGem {
-    return JSON.parse(JSON.stringify({ ...gem, assign: coreIndex }));
-  }
-
-  function buildAssignedGems(assignedGemIndexes: number[][]): ArkGridGem[][] {
+  function buildAssignedGems(
+    assignedGemIndexes: number[][],
+    snapshot: ArkGridGem[] | undefined
+  ): ArkGridGem[][] {
     const orderGems = profile.gems.orderGems;
     const chaosGems = profile.gems.chaosGems;
     const gemPools = [orderGems, orderGems, orderGems, chaosGems, chaosGems, chaosGems];
 
+    // Build a consumable multiset of snapshot fingerprints for isNew detection
+    const snapshotCounts = new Map<string, number>();
+    if (snapshot) {
+      for (const gem of snapshot) {
+        const fp = gemFingerprint(gem);
+        snapshotCounts.set(fp, (snapshotCounts.get(fp) ?? 0) + 1);
+      }
+    }
+
     return assignedGemIndexes.map((indexes, coreIndex) =>
-      indexes.map((gemIndex) => cloneAssignedGem(gemPools[coreIndex][gemIndex], coreIndex))
+      indexes.map((gemIndex) => {
+        const gem = gemPools[coreIndex][gemIndex];
+        const fp = gemFingerprint(gem);
+        const count = snapshotCounts.get(fp) ?? 0;
+        const isNew = !snapshot || count === 0;
+        if (count > 0) snapshotCounts.set(fp, count - 1);
+        return JSON.parse(JSON.stringify({ ...gem, assign: coreIndex, isNew })) as ArkGridGem;
+      })
     );
   }
 
@@ -173,28 +190,16 @@
     }
 
     const attrLabel = {
-      ko_kr: {
-        질서: '질서',
-        혼돈: '혼돈',
-      },
-      en_us: {
-        질서: 'Order',
-        혼돈: 'Chaos',
-      },
+      ko_kr: { 질서: '질서', 혼돈: '혼돈' },
+      en_us: { 질서: 'Order', 혼돈: 'Chaos' },
     }[locale][progress.attr ?? '질서'];
 
     return `${baseLabel} (${attrLabel} ${progress.current}/${progress.total})`;
   }
 
   function getProgressLogKey(progress: SolverProgress | null) {
-    if (!progress) {
-      return '';
-    }
-
-    if (progress.stage !== 'simulating_launcher_gems') {
-      return progress.stage;
-    }
-
+    if (!progress) return '';
+    if (progress.stage !== 'simulating_launcher_gems') return progress.stage;
     return `${progress.stage}:${progress.attr ?? ''}`;
   }
 
@@ -203,23 +208,30 @@
 
     isSolving = true;
     progressLog = [];
-    solveProgress = {
-      stage: 'preparing',
-      totalPercent: 0,
-      stagePercent: 0,
-    };
+    solveProgress = { stage: 'preparing', totalPercent: 0, stagePercent: 0 };
 
     try {
+      // isNew detection: compare against previously *assigned* gems, not the full pool.
+      const previousAssigned = profile.solveInfo.after?.solveAnswer?.assignedGems.flat();
+
       const result = await solverController.runSolve(profile);
 
-      updateSolveAnswer({
-        assignedGems: buildAssignedGems(result.assignedGemIndexes),
-        gemSetPackTuple: result.gemSetPackTuple,
-      });
-      updateScoreSet(result.scoreSet);
-      updateAnswerCores(JSON.parse(JSON.stringify(profile.cores)));
-      updateAdditionalGemResult(result.additionalGemResult);
-      updateNeedLauncherGem(result.needLauncherGem);
+      const after: SolveAfter = {
+        solveAnswer: {
+          assignedGems: buildAssignedGems(result.assignedGemIndexes, previousAssigned),
+          gemSetPackTuple: result.gemSetPackTuple,
+        },
+        scoreSet: result.scoreSet,
+        answerCores: JSON.parse(JSON.stringify(profile.cores)),
+        additionalGemResult: result.additionalGemResult,
+        needLauncherGem: result.needLauncherGem,
+        gemSnapshot: JSON.parse(JSON.stringify([
+          ...profile.gems.orderGems,
+          ...profile.gems.chaosGems,
+        ])),
+      };
+      updateSolveAfter(after);
+      solveAfter = after;
     } catch (error) {
       console.error(error);
     } finally {
@@ -249,6 +261,7 @@
         {/each}
       </div>
     </div>
+
     {#if failedSign.order || failedSign.chaos}
       <div class="failed-sign">
         {#if failedSign.order}
@@ -260,9 +273,22 @@
         <div class="small">{LFailed}</div>
       </div>
     {/if}
-    <button class="solve-button" onclick={runSolve} disabled={isSolving} data-track="run-solve"
-      >{isSolving ? LRunning : LRunSolve}</button
+    <button
+      class="solve-button"
+      onclick={runSolve}
+      disabled={isSolving}
+      data-track="run-solve"
     >
+      {isSolving ? LRunning : LRunSolve}
+    </button>
+    <div class="optimize-hint">
+      {LOptimizeHint}
+      <span class="tooltip">
+        <i class="fa-solid fa-circle-info info-icon"></i>
+        <span class="tooltip-text">{LOptimizeTooltip}</span>
+      </span>
+    </div>
+
     {#if solveProgress || progressLog.length > 0}
       <div class="solve-progress">
         <div class="title">{LProgressTitle}</div>
@@ -288,8 +314,9 @@
         </div>
       </div>
     {/if}
-    {#if profile.solveInfo.after}
-      <SolveResult solveAfter={profile.solveInfo.after}></SolveResult>
+
+    {#if solveAfter}
+      <SolveResult solveAfter={solveAfter}></SolveResult>
     {/if}
   </div>
 </div>
@@ -303,6 +330,36 @@
     width: 15rem;
     height: 4rem;
     align-self: center;
+  }
+  .optimize-hint {
+    font-size: 0.85rem;
+    color: var(--text-muted, #888);
+    display: flex;
+    align-items: center;
+    gap: 0.3rem;
+  }
+  .tooltip {
+    position: relative;
+    display: inline-block;
+  }
+  .tooltip-text {
+    visibility: hidden;
+    position: absolute;
+    bottom: 125%;
+    left: 50%;
+    transform: translateX(-50%);
+    background: var(--card);
+    border: 1px solid var(--border);
+    border-radius: 0.4rem;
+    padding: 0.5rem 0.75rem;
+    width: 22rem;
+    font-size: 0.85rem;
+    line-height: 1.4;
+    z-index: 10;
+    white-space: normal;
+  }
+  .tooltip:hover .tooltip-text {
+    visibility: visible;
   }
   .solve-progress {
     width: min(32rem, 100%);

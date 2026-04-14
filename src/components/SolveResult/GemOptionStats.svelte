@@ -1,12 +1,13 @@
 <script lang="ts">
-  import { type ArkGridGemOptionName, ArkGridGemOptionTypes } from '../../lib/models/arkGridGems';
+  import { type ArkGridGem, type ArkGridGemOptionName, ArkGridGemOptionTypes } from '../../lib/models/arkGridGems';
   import { appLocale } from '../../lib/state/locale.state.svelte';
   import type { SolveAnswer } from '../../lib/state/profile.state.svelte';
 
   type Props = {
-    solveAnswer: SolveAnswer;
+    solveAnswer?: SolveAnswer;
+    assignedGems?: ArkGridGem[][];
   };
-  let { solveAnswer }: Props = $props();
+  let { solveAnswer, assignedGems }: Props = $props();
   let answerStatistics: Record<ArkGridGemOptionName, number> = $derived.by(() => {
     let statistics = {
       공격력: 0,
@@ -16,9 +17,10 @@
       '아군 공격 강화': 0,
       '아군 피해 강화': 0,
     };
-    if (!solveAnswer) return statistics;
-    for (const gems of solveAnswer.assignedGems) {
-      for (const gem of gems) {
+    const allGems = assignedGems ?? solveAnswer?.assignedGems;
+    if (!allGems) return statistics;
+    for (const coreGems of allGems) {
+      for (const gem of coreGems) {
         statistics[gem.option1.optionType] += gem.option1.value;
         statistics[gem.option2.optionType] += gem.option2.value;
       }
@@ -27,10 +29,7 @@
   });
   let locale = $derived(appLocale.current);
   const LTitle = $derived(
-    {
-      ko_kr: '젬 옵션',
-      en_us: 'Astrogem Options',
-    }[locale]
+    { ko_kr: '젬 옵션', en_us: 'Astrogem Options' }[locale]
   );
 </script>
 

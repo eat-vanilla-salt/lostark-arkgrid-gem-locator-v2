@@ -99,7 +99,7 @@
       <span class="tooltip-text">{LTitleDesc}</span>
     </span>
   </div>
-  {#each ArkGridAttrs as attr}
+  {#each Object.values(ArkGridAttrs) as attr}
     <div class="attr-container">
       <div class="title">
         <div class="main">

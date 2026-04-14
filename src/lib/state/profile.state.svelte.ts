@@ -69,6 +69,7 @@ export type SolveAfter = {
   answerCores?: Record<ArkGridAttr, Record<ArkGridCoreType, ArkGridCore | null>>;
   additionalGemResult?: AdditionalGemResult;
   needLauncherGem?: NeedLauncherGem;
+  gemSnapshot?: ArkGridGem[];
 };
 export type SolveInfo = {
   before: SolveBefore;
@@ -134,6 +135,11 @@ export function updateNeedLauncherGem(needLauncherGem: NeedLauncherGem) {
   } else {
     profile.solveInfo.after.needLauncherGem = needLauncherGem;
   }
+}
+
+export function updateSolveAfter(data: SolveAfter) {
+  const profile = getCurrentProfile();
+  profile.solveInfo.after = data;
 }
 
 export function initNewProfile(name: string): CharacterProfile {

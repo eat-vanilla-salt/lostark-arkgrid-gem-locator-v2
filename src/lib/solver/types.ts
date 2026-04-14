@@ -49,6 +49,10 @@ export type SolverRunPayload = {
   orderGems: ArkGridGem[];
   chaosGems: ArkGridGem[];
   isSupporter: boolean;
+  // Per-attr stability tiebreaker bitmasks — separate because order/chaos gem indices are
+  // independent arrays, so a single shared bitmask would be meaningless for both sides.
+  orderCurrentBitmasks?: bigint[];
+  chaosCurrentBitmasks?: bigint[];
 };
 
 export type SolverRunResult = {

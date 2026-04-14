@@ -132,7 +132,6 @@
   }
   .total-score::after {
     content: ' / 100';
-    font-size: 1rem;
   }
   /* 바 */
   .score-bar {

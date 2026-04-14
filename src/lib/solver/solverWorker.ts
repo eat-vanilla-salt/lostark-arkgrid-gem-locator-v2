@@ -12,6 +12,7 @@ import {
 } from './models';
 import { getBestGemSetPacks, getMaxStat, getPossibleGemSets } from './solver';
 import type {
+  PlainGemSetPack,
   SolverAdditionalGemResult,
   SolverProgress,
   SolverProgressStage,
@@ -114,6 +115,10 @@ type SolveOptions = {
   attr?: ArkGridAttr;
   orderCurrentBitmasks?: bigint[];
   chaosCurrentBitmasks?: bigint[];
+  // Pre-computed attMax/skillMax/bossMax from the main thread (via DP).
+  // When provided, the worker only builds GemSets for the side it's solving;
+  // the other side's GemSets are not needed for score maps.
+  precomputedStats?: { attMax: number; skillMax: number; bossMax: number };
 };
 
 function popcount(n: bigint): number {
@@ -250,11 +255,15 @@ function solve(
   rawChaosCores: WorkerCore[],
   inOrderGems: ArkGridGem[],
   inChaosGems: ArkGridGem[],
-  { isSupporter = false, perfectSolve = false, precalculatedGsp, onStep, attr, orderCurrentBitmasks, chaosCurrentBitmasks }: SolveOptions = {},
+  { isSupporter = false, perfectSolve = false, precalculatedGsp, onStep, attr, orderCurrentBitmasks, chaosCurrentBitmasks, precomputedStats }: SolveOptions = {},
   report?: ProgressReporter
 ): SolveResultInternal {
-  const solveOrder = !attr || attr === '질서';
-  const solveChaos = !attr || attr === '혼돈';
+  // When precomputedStats are provided (two-phase memory-efficient flow), skip building
+  // GemSets for any side whose GspList is already precalculated.  Otherwise always build
+  // both sides so attMax/skillMax/bossMax reflect the full 6-core pool.
+  const havePrecomputed = !!precomputedStats;
+  const needOrderGemSets = !havePrecomputed || !precalculatedGsp?.order;
+  const needChaosGemSets = !havePrecomputed || !precalculatedGsp?.chaos;
 
   emitProgress(report, 'preparing', 0);
   const orderCores = rawOrderCores.map(toCore);
@@ -263,8 +272,13 @@ function solve(
   const { gems: orderGems } = convertToSolverGems(inOrderGems, isSupporter);
   const { gems: chaosGems } = convertToSolverGems(inChaosGems, isSupporter);
 
-  const orderGssList = solveOrder ? orderCores.map((core) => getPossibleGemSets(core, orderGems)) : [];
-  const chaosGssList = solveChaos ? chaosCores.map((core) => getPossibleGemSets(core, chaosGems)) : [];
+  // Build GemSet lists only for the sides that need them.
+  const orderGssList: GemSet[][] = needOrderGemSets
+    ? orderCores.map((core) => getPossibleGemSets(core, orderGems))
+    : [];
+  const chaosGssList: GemSet[][] = needChaosGemSets
+    ? chaosCores.map((core) => getPossibleGemSets(core, chaosGems))
+    : [];
 
   if (perfectSolve) {
     for (const gssList of [orderGssList, chaosGssList]) {
@@ -291,15 +305,25 @@ function solve(
     }
   }
 
-  const relevantGssList = orderGssList.concat(chaosGssList);
-  let attMax = 0;
-  let skillMax = 0;
-  let bossMax = 0;
+  // Compute attMax/skillMax/bossMax.  If the caller pre-computed these via DP in the
+  // main thread, use them directly so we don't need both sides' GemSet lists alive at once.
+  let attMax: number;
+  let skillMax: number;
+  let bossMax: number;
 
-  for (const gss of relevantGssList) {
-    attMax += getMaxStat(gss, 'att');
-    skillMax += getMaxStat(gss, 'skill');
-    bossMax += getMaxStat(gss, 'boss');
+  if (havePrecomputed) {
+    ({ attMax, skillMax, bossMax } = precomputedStats);
+  } else {
+    // Both sides were built — derive stats from them (original path).
+    const allGssList = orderGssList.concat(chaosGssList);
+    attMax = 0;
+    skillMax = 0;
+    bossMax = 0;
+    for (const gss of allGssList) {
+      attMax += getMaxStat(gss, 'att');
+      skillMax += getMaxStat(gss, 'skill');
+      bossMax += getMaxStat(gss, 'boss');
+    }
   }
 
   const gemOptionCoeff = isSupporter ? gemOptionLevelCoeffsSupporter : gemOptionLevelCoeffs;
@@ -309,7 +333,9 @@ function solve(
     buildScoreMap(gemOptionCoeff[2], bossMax),
   ];
 
-  for (const gss of relevantGssList) {
+  // Set score ranges on the GemSets we actually built.
+  // Precalculated GspList entries already have their ranges set by Phase-1 worker.
+  for (const gss of orderGssList.concat(chaosGssList)) {
     for (const gs of gss) {
       gs.setScoreRange(scoreMaps);
     }
@@ -317,25 +343,28 @@ function solve(
 
   emitProgress(report, 'preparing', 100);
 
+  // Phase 2: Order
   let orderGspList: GemSetPack[] = [];
-  if (solveOrder) {
+  if (precalculatedGsp?.order) {
+    // Received as plain objects via structured clone — duck typing works for all consumers.
+    orderGspList = precalculatedGsp.order as unknown as GemSetPack[];
+  } else if (!attr || attr === '질서') {
     emitProgress(report, 'searching_order_packs', 0);
-    orderGspList = precalculatedGsp?.order
-      ? [...precalculatedGsp.order]
-      : getBestGemSetPacks(orderGssList, scoreMaps, perfectSolve, ({ current, total }) => {
-          emitProgress(report, 'searching_order_packs', (current / total) * 100, { current, total });
-        });
+    orderGspList = getBestGemSetPacks(orderGssList, scoreMaps, perfectSolve, ({ current, total }) => {
+      emitProgress(report, 'searching_order_packs', (current / total) * 100, { current, total });
+    });
     emitProgress(report, 'searching_order_packs', 100);
   }
 
+  // Phase 2: Chaos
   let chaosGspList: GemSetPack[] = [];
-  if (solveChaos) {
+  if (precalculatedGsp?.chaos) {
+    chaosGspList = precalculatedGsp.chaos as unknown as GemSetPack[];
+  } else if (!attr || attr === '혼돈') {
     emitProgress(report, 'searching_chaos_packs', 0);
-    chaosGspList = precalculatedGsp?.chaos
-      ? [...precalculatedGsp.chaos]
-      : getBestGemSetPacks(chaosGssList, scoreMaps, perfectSolve, ({ current, total }) => {
-          emitProgress(report, 'searching_chaos_packs', (current / total) * 100, { current, total });
-        });
+    chaosGspList = getBestGemSetPacks(chaosGssList, scoreMaps, perfectSolve, ({ current, total }) => {
+      emitProgress(report, 'searching_chaos_packs', (current / total) * 100, { current, total });
+    });
     emitProgress(report, 'searching_chaos_packs', 100);
   }
 
@@ -362,17 +391,15 @@ function solve(
     return best;
   }
 
-  const bestOrderGsp = solveOrder ? pickBestGsp(orderGspList, orderCurrentBitmasks) : null;
-  const bestChaosGsp = solveChaos ? pickBestGsp(chaosGspList, chaosCurrentBitmasks) : null;
+  const bestOrderGsp = orderGspList.length > 0 ? pickBestGsp(orderGspList, orderCurrentBitmasks) : null;
+  const bestChaosGsp = chaosGspList.length > 0 ? pickBestGsp(chaosGspList, chaosCurrentBitmasks) : null;
 
-  let answer = new GemSetPackTuple(
-    solveOrder ? bestOrderGsp : null,
-    solveChaos ? bestChaosGsp : null,
-    isSupporter
-  );
+  let answer = new GemSetPackTuple(bestOrderGsp, bestChaosGsp, isSupporter);
 
-  // Only run the cross-product combining step when solving both attrs together
-  if (solveOrder && solveChaos) {
+  // Phase 3: cross-product — run whenever BOTH lists are available (not just when we ran
+  // both Phase 2s from scratch).  This covers the two-phase memory fix path where
+  // orderGspList comes from Phase-1 worker and chaosGspList was just computed here.
+  if (orderGspList.length > 0 && chaosGspList.length > 0) {
     emitProgress(report, 'combining_results', 0);
     const gemSetPackSet: GemSetPack[][] = [[], []];
 
@@ -412,15 +439,20 @@ function solve(
     emitProgress(report, 'combining_results', 100);
   }
 
+  // When attr is specified, zero out the other attr's assignments so callers (SolvePanel)
+  // only see results for the requested side — preserving the per-attr result structure.
+  const includeOrder = !attr || attr === '질서';
+  const includeChaos = !attr || attr === '혼돈';
+
   return {
     answer,
     assignedGemIndexes: [
-      assignGemIndexes(answer.gsp1?.gs1),
-      assignGemIndexes(answer.gsp1?.gs2),
-      assignGemIndexes(answer.gsp1?.gs3),
-      assignGemIndexes(answer.gsp2?.gs1),
-      assignGemIndexes(answer.gsp2?.gs2),
-      assignGemIndexes(answer.gsp2?.gs3),
+      includeOrder ? assignGemIndexes(answer.gsp1?.gs1) : [],
+      includeOrder ? assignGemIndexes(answer.gsp1?.gs2) : [],
+      includeOrder ? assignGemIndexes(answer.gsp1?.gs3) : [],
+      includeChaos ? assignGemIndexes(answer.gsp2?.gs1) : [],
+      includeChaos ? assignGemIndexes(answer.gsp2?.gs2) : [],
+      includeChaos ? assignGemIndexes(answer.gsp2?.gs3) : [],
     ],
     needLauncherGem: {
       질서: isGspNeedMoreGem(answer.gsp1),
@@ -499,7 +531,7 @@ function createProgressReporter(postProgress: ProgressReporter): ProgressReporte
 }
 
 function runSolve(payload: SolverRunPayload, report: ProgressReporter): SolverRunResult {
-  const { orderCores, chaosCores, orderGems, chaosGems, isSupporter, attr, orderCurrentBitmasks, chaosCurrentBitmasks } = payload;
+  const { orderCores, chaosCores, orderGems, chaosGems, isSupporter, attr, orderCurrentBitmasks, chaosCurrentBitmasks, precomputedStats, precalculatedOrderGspList } = payload;
   const perfectOrderGems: ArkGridGem[] = [];
   const perfectChaosGems: ArkGridGem[] = [];
 
@@ -523,6 +555,8 @@ function runSolve(payload: SolverRunPayload, report: ProgressReporter): SolverRu
       attr,
       orderCurrentBitmasks,
       chaosCurrentBitmasks,
+      precomputedStats,
+      precalculatedGsp: precalculatedOrderGspList ? { order: precalculatedOrderGspList as unknown as import('./models').GemSetPack[] } : undefined,
       onStep: (order, chaos) => {
         precalculatedGspListOrder = { order };
         precalculatedGspListChaos = { chaos };
@@ -532,7 +566,21 @@ function runSolve(payload: SolverRunPayload, report: ProgressReporter): SolverRu
   );
 
   const answer = solved.answer;
-  const score = (answer.score - 1) * 100;
+
+  // When Phase 3 ran (precalculatedOrderGspList provided), answer has both gsp1 and gsp2 set
+  // and answer.score is the combined score.  For per-attr display we extract the single-attr
+  // contribution.  When Phase 3 did not run (old path), gsp2 is null so the formula is the same.
+  let score: number;
+  if (attr === '질서') {
+    score = (new GemSetPackTuple(answer.gsp1, null, isSupporter).score - 1) * 100;
+  } else if (attr === '혼돈') {
+    score = (new GemSetPackTuple(null, answer.gsp2, isSupporter).score - 1) * 100;
+  } else {
+    score = (answer.score - 1) * 100;
+  }
+
+  // Best score: run with perfect gems for the same attr — always single-attr since
+  // chaos Phase 2 is skipped when attr='질서' (chaosGspList stays empty → no Phase 3).
   const bestScore =
     (solve(orderCores, chaosCores, perfectOrderGems, perfectChaosGems, {
       isSupporter,
@@ -637,6 +685,58 @@ function runSolve(payload: SolverRunPayload, report: ProgressReporter): SolverRu
   };
 }
 
+// Phase-1 handler: build orderGssList, run order Phase 2, return serialized GspList.
+// The worker terminates after posting this response so the OS reclaims its memory
+// before the Phase-2+3 worker starts.
+function runSolvePhase2Order(payload: SolverRunPayload, report: ProgressReporter): PlainGemSetPack[] {
+  const { orderCores, chaosCores, orderGems, chaosGems, isSupporter, precomputedStats } = payload;
+  const { gems: solverOrderGems } = convertToSolverGems(orderGems, isSupporter);
+  const orderCoreObjs = orderCores.map(toCore);
+
+  const orderGssList = orderCoreObjs.map((core) => getPossibleGemSets(core, solverOrderGems));
+
+  let attMax: number;
+  let skillMax: number;
+  let bossMax: number;
+  if (precomputedStats) {
+    ({ attMax, skillMax, bossMax } = precomputedStats);
+  } else {
+    // Fallback: build chaos GemSets too just to get correct combined stats.
+    const chaosCoreObjs = chaosCores.map(toCore);
+    const { gems: solverChaosGems } = convertToSolverGems(chaosGems, isSupporter);
+    const chaosGssList = chaosCoreObjs.map((core) => getPossibleGemSets(core, solverChaosGems));
+    const allGssList = orderGssList.concat(chaosGssList);
+    attMax = 0; skillMax = 0; bossMax = 0;
+    for (const gss of allGssList) {
+      attMax += getMaxStat(gss, 'att');
+      skillMax += getMaxStat(gss, 'skill');
+      bossMax += getMaxStat(gss, 'boss');
+    }
+  }
+
+  const gemOptionCoeff = isSupporter ? gemOptionLevelCoeffsSupporter : gemOptionLevelCoeffs;
+  const scoreMaps = [
+    buildScoreMap(gemOptionCoeff[0], attMax),
+    buildScoreMap(gemOptionCoeff[1], skillMax),
+    buildScoreMap(gemOptionCoeff[2], bossMax),
+  ];
+
+  for (const gss of orderGssList) {
+    for (const gs of gss) {
+      gs.setScoreRange(scoreMaps);
+    }
+  }
+
+  emitProgress(report, 'searching_order_packs', 0);
+  const orderGspList = getBestGemSetPacks(orderGssList, scoreMaps, false, ({ current, total }) => {
+    emitProgress(report, 'searching_order_packs', (current / total) * 100, { current, total });
+  });
+  emitProgress(report, 'searching_order_packs', 100);
+
+  // Structured clone preserves BigInt bitmasks and all plain properties.
+  return orderGspList as unknown as PlainGemSetPack[];
+}
+
 self.onmessage = (e: MessageEvent<SolverWorkerRequest>) => {
   const data = e.data;
 
@@ -657,6 +757,27 @@ self.onmessage = (e: MessageEvent<SolverWorkerRequest>) => {
       } catch (error) {
         self.postMessage({
           type: 'runSolve:error',
+          message: error instanceof Error ? error.message : String(error),
+        } satisfies SolverWorkerResponse);
+      }
+      break;
+
+    case 'runSolvePhase2Order':
+      try {
+        const report = createProgressReporter((progress) => {
+          self.postMessage({
+            type: 'runSolvePhase2Order:progress',
+            progress,
+          } satisfies SolverWorkerResponse);
+        });
+
+        self.postMessage({
+          type: 'runSolvePhase2Order:done',
+          gspList: runSolvePhase2Order(data.payload, report),
+        } satisfies SolverWorkerResponse);
+      } catch (error) {
+        self.postMessage({
+          type: 'runSolvePhase2Order:error',
           message: error instanceof Error ? error.message : String(error),
         } satisfies SolverWorkerResponse);
       }
